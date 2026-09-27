@@ -3,6 +3,7 @@
 
 #include <utility>
 #include <type_traits>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <tuple>
@@ -11,7 +12,11 @@
 #include <optional>
 #include <variant>
 #include <string_view>
+#include <string>
+#include <iostream>
+#include <stdexcept>
 #include <ostream>
+#include <regex>
 
 namespace ctpg
 {
@@ -91,6 +96,41 @@ namespace meta
 
 namespace stdex
 {
+    class dyn_bitset
+    {
+    public:
+        dyn_bitset() = default;
+        explicit dyn_bitset(size_t n) : data_((n + 63) >> 6, 0), bit_count_(n) {}
+
+        void resize(size_t n) { data_.assign((n + 63) >> 6, 0); bit_count_ = n; }
+
+        void set(size_t i)        { data_[i >> 6] |=  uint64_t(1) << (i & 63); }
+        void reset(size_t i)      { data_[i >> 6] &= ~(uint64_t(1) << (i & 63)); }
+        bool test(size_t i) const { return (data_[i >> 6] >> (i & 63)) & 1; }
+
+        bool add(const dyn_bitset& o)
+        {
+            bool changed = false;
+            for (size_t k = 0; k < data_.size(); ++k)
+            {
+                uint64_t nv = data_[k] | o.data_[k];
+                if (nv != data_[k]) { data_[k] = nv; changed = true; }
+            }
+            return changed;
+        }
+
+        bool operator==(const dyn_bitset& o) const { return data_ == o.data_; }
+        bool operator!=(const dyn_bitset& o) const { return !(*this == o); }
+        size_t size() const { return bit_count_; }
+
+        const std::vector<uint64_t>& raw() const { return data_; }
+        std::vector<uint64_t>&       raw()       { return data_; }
+
+    private:
+        std::vector<uint64_t> data_;
+        size_t bit_count_ = 0;
+    };
+
     template<typename T>
     struct is_cvector_compatible : std::bool_constant<std::is_default_constructible_v<T> && std::is_trivially_destructible_v<T>>
     {};
@@ -912,6 +952,11 @@ public:
 
     constexpr const auto& get_ftor() const { return utils::first_sv_char; }
 
+    size_t match(std::string_view sv) const
+    {
+        return (!sv.empty() && sv[0] == c) ? 1 : 0;
+    }
+
 private:
     char c;
     char id[utils::char_names::name_size] = {};
@@ -936,6 +981,14 @@ public:
     constexpr const auto& get_data() const { return data; }
 
     constexpr const auto& get_ftor() const { return utils::pass_sv; }
+
+    size_t match(std::string_view sv) const
+    {
+        if (sv.size() < DataSize - 1) return 0;
+        for (size_t i = 0; i < DataSize - 1; ++i)
+            if (sv[i] != data[i]) return 0;
+        return DataSize - 1;
+    }
 
 private:
     char data[DataSize] = {};
@@ -964,6 +1017,8 @@ public:
 
     constexpr const ftor_type& get_ftor() const { return ftor; }
 
+    size_t match(std::string_view sv) const { return term.match(sv); }
+
 private:
     Term term;
     ftor_type ftor;
@@ -987,6 +1042,8 @@ public:
     using ftor_type = Ftor;
 
     constexpr const ftor_type& get_ftor() const { return ftor; }
+
+    size_t match(std::string_view) const { return 0; }
 
 private:
     const char* custom_name;
@@ -1062,493 +1119,6 @@ struct recognized_term
     size16_t term_idx = uninitialized16;
     size_t len = uninitialized16;
 };
-
-namespace regex
-{
-    using conflicted_terms = size16_t[4];
-
-    constexpr void add_conflicted_term(conflicted_terms& ts, size16_t t)
-    {
-        for (size_t i = 0; i < 4; ++i)
-            if (ts[i] == uninitialized16)
-            {
-                ts[i] = t;
-                break;
-            }
-    }
-
-    static const size_t transitions_size = meta::distinct_values_count<char>;
-
-    template<size_t N>
-    struct dfa_state
-    {
-        constexpr dfa_state()
-        {
-            for (auto& t : transitions)
-                t = uninitialized16;
-        }
-
-        size8_t start_state = 0;
-        size8_t end_state = 0;
-        size8_t unreachable = 0;
-        conflicted_terms conflicted_recognition = { uninitialized16, uninitialized16, uninitialized16, uninitialized16 };
-        size16_t transitions[transitions_size] = {};
-        stdex::cbitset<N> merged_from = {};
-    };
-
-    struct char_range
-    {
-        constexpr char_range(char c):
-            start(c), end(c)
-        {}
-
-        constexpr char_range(char c1, char c2):
-            start(c1), end(c2)
-        {}
-        char start;
-        char end;
-    };
-
-    constexpr char hex_digits_to_char(char d1, char d2)
-    {
-        auto dd = [](char d) -> char
-        {
-            if (d >= 'A' && d <= 'F')
-                return char(10) + d - 'A';
-            else if (d >= 'a' && d <= 'f')
-                return char(10) + d - 'a';
-            else
-                return d - '0';
-        };
-        return dd(d1) * 16 + dd(d2);
-    }
-
-    class char_subset
-    {
-    public:
-        constexpr char_subset() = default;
-
-        template<size_t N>
-        constexpr char_subset(const char (&str)[N])
-        {
-            for (size_t i = 0; i < N - 1; ++i)  // ignore trailing 0, so N - 1
-                data.set(utils::char_to_idx(str[i]));
-        }
-
-        constexpr char_subset(char_range r)
-        {
-            add_range(r);
-        }
-
-        constexpr char_subset& add_range(char_range r)
-        {
-            for (size_t i = utils::char_to_idx(r.start); i <= utils::char_to_idx(r.end); ++i)
-                data.set(i);
-            return *this;
-        }
-
-        constexpr bool test(size_t idx) const { return data.test(idx); }
-        constexpr size_t size() const { return data.size(); }
-        constexpr char_subset& set() { data.set(); return *this; }
-        constexpr char_subset& flip() { data.flip(); return *this; }
-        constexpr char_subset& set(size_t idx) { data.set(idx); return *this; }
-
-    private:
-        stdex::cbitset<meta::distinct_values_count<char>> data = {};
-    };
-
-    template<size_t N>
-    using dfa = stdex::cvector<dfa_state<N>, N>;
-
-    class dfa_size_analyzer
-    {
-    public:
-        using slice = utils::slice;
-
-        constexpr slice primary_char(char) { return prim(); }
-        constexpr slice primary_subset(char_subset&&) { return prim(); }
-
-        constexpr slice star(slice s) { return s; }
-        constexpr slice plus(slice s) { return s; }
-        constexpr slice opt(slice s) { return s; }
-        constexpr slice cat(slice s1, slice s2) { return add(s1, s2); }
-        constexpr slice alt(slice s1, slice s2) { return add(s1, s2); }
-
-        constexpr slice rep(slice s, size32_t n)
-        {
-            if (n == 0)
-                return s;
-            size += (s.n * (n - 1));
-            return slice{ s.start, s.n * n };
-        }
-
-    private:
-        constexpr slice prim() { auto old = size; size += 2; return slice{ old, 2 }; }
-        constexpr slice add(slice s1, slice s2) { return slice{ s1.start, s1.n + s2.n }; }
-
-        size32_t size = 0;
-    };
-
-    template<size_t N>
-    class dfa_builder
-    {
-    public:
-        constexpr dfa_builder(dfa<N>& sm):
-            sm(sm)
-        {}
-
-        using slice = utils::slice;
-        using dfa_state_n = dfa_state<N>;
-
-        constexpr dfa_state_n& transition(dfa_state_n& from, const char_subset& s)
-        {
-            for (size_t i = 0; i < s.size(); ++i)
-                if (s.test(i))
-                {
-                    from.transitions[i] = size16_t(sm.size());
-                }
-            sm.push_back(dfa_state_n());
-            return sm.back();
-        }
-
-        constexpr dfa_state_n& transition(dfa_state_n& from, char c)
-        {
-            from.transitions[utils::char_to_idx(c)] = size16_t(sm.size());
-            sm.push_back(dfa_state_n());
-            return sm.back();
-        }
-
-        constexpr slice primary_char(char c)
-        {
-            return primary_subset(char_subset(char_range(c)));
-        }
-
-        constexpr slice primary_subset(const char_subset& s)
-        {
-            size_t old_size = sm.size();
-            sm.push_back(dfa_state_n());
-            sm.back().start_state = 1;
-            dfa_state_n& to = transition(sm.back(), s);
-            to.end_state = 1;
-            return slice{ size32_t(old_size), 2 };
-        }
-
-        constexpr slice star(slice s)
-        {
-            size_t b = s.start;
-            sm[b].end_state = 1;
-            for (size_t i = s.start; i < s.start + s.n; ++i)
-            {
-                if (sm[i].end_state)
-                    merge(i, b);
-            }
-            return s;
-        }
-
-        constexpr slice plus(slice s)
-        {
-            size_t b = s.start;
-            for (size_t i = s.start; i < s.start + s.n; ++i)
-            {
-                if (sm[i].end_state)
-                    merge(i, b, true);
-            }
-            return s;
-        }
-
-        constexpr slice opt(slice s)
-        {
-            sm[s.start].end_state = 1;
-            return s;
-        }
-
-        constexpr slice rep(slice s, size32_t n)
-        {
-            if (n == 0)
-            {
-                for (size_t j = s.start; j < s.start + s.n; ++j)
-                {
-                    if (sm[j].start_state)
-                    {
-                        for (auto& t : sm[j].transitions)
-                            t = uninitialized16;
-                        sm[j].end_state = 1;
-                        sm[j].start_state = 0;
-                    }
-                    else
-                        sm[j].unreachable = 1;
-                }
-                return s;
-            }
-
-            for (size_t i = 0; i < n - 1; ++i)
-            {
-                for (size_t j = s.start; j < s.start + s.n; ++j)
-                {
-                    sm.push_back(sm[j]);
-                    auto& st = sm.back();
-                    for (auto& t : st.transitions)
-                    {
-                        if (t != uninitialized16)
-                            t += size16_t(s.n * (i + 1));
-                    }
-                }
-            }
-            slice whole = s;
-            for (size_t i = 0; i < n - 1; ++i)
-            {
-                cat(whole, slice{ whole.start + whole.n, s.n });
-                whole = slice{ whole.start, whole.n + s.n};
-            }
-            return whole;
-        }
-
-        constexpr slice cat(slice s1, slice s2)
-        {
-            size_t b = s2.start;
-            for (size_t i = s1.start; i < s1.start + s1.n; ++i)
-            {
-                if (sm[i].end_state)
-                    merge(i, b, false, true);
-            }
-            return slice{ s1.start, s1.n + s2.n };
-        }
-
-        constexpr slice alt(slice s1, slice s2)
-        {
-            size_t b1 = s1.start;
-            size_t b2 = s2.start;
-            merge(b1, b2, true, true);
-            return slice{ s1.start, s1.n + s2.n };
-        }
-
-        constexpr void mark_end_states(slice s, size16_t idx)
-        {
-            for (size_t i = s.start; i < s.start + s.n; ++i)
-            {
-                mark_end_state(sm[i], idx);
-            }
-        }
-
-        constexpr size_t size() const { return sm.size(); }
-
-    private:
-        constexpr void merge(size_t to, size_t from, bool keep_end_state = false, bool mark_from_as_unreachable = false)
-        {
-            if (to == from)
-                return;
-
-            dfa_state_n& s_from = sm[from];
-            dfa_state_n& s_to = sm[to];
-
-            if (s_to.merged_from.test(from))
-                return;
-
-            s_to.merged_from.set(from);
-
-            s_from.start_state = 0;
-            if (keep_end_state)
-                s_to.end_state = s_to.end_state || s_from.end_state;
-            else
-                s_to.end_state = s_from.end_state;
-
-            s_from.unreachable = mark_from_as_unreachable ? 1 : 0;
-
-            for (size_t i = 0; i < transitions_size; ++i)
-            {
-                size16_t& tr_from = s_from.transitions[i];
-                if (tr_from == uninitialized16)
-                    continue;
-                size16_t& tr_to = s_to.transitions[i];
-                if (tr_to == uninitialized16)
-                {
-                    tr_to = tr_from;
-                    sm[tr_to].unreachable = 0;
-                }
-                else
-                    merge(tr_to, tr_from, keep_end_state, mark_from_as_unreachable);
-            }
-
-            auto& cr = s_from.conflicted_recognition;
-            for (size_t j = 0; j < 4; ++j)
-            {
-                size16_t term_idx = cr[j];
-                if (term_idx != uninitialized16)
-                    mark_end_state(s_to, term_idx);
-                else
-                    break;
-            }
-        }
-
-        constexpr void mark_end_state(dfa_state_n& s, size16_t idx)
-        {
-            if (!s.end_state)
-                return;
-            add_conflicted_term(s.conflicted_recognition, idx);
-        }
-
-        dfa<N>& sm;
-    };
-
-    template<size_t N>
-    struct regex_pattern_data
-    {
-        const char (&pattern)[N];
-    };
-
-    template<size_t N>
-    constexpr void add_term_data_to_dfa(char c, dfa_builder<N>& b, size16_t idx)
-    {
-        using slice = utils::slice;
-
-        slice prev{0, size32_t(b.size())};
-        slice new_sl = b.primary_char(c);
-        b.mark_end_states(new_sl, idx);
-        b.alt(prev, new_sl);
-    }
-
-    template<size_t N, size_t DataSize>
-    constexpr void add_term_data_to_dfa(const char (&str)[DataSize], dfa_builder<N>& b, size16_t idx)
-    {
-        using slice = utils::slice;
-        slice prev{0, size32_t(b.size())};
-
-        slice whole = b.primary_char(str[0]);
-        for (size_t i = 1; i < DataSize - 1; ++i)
-        {
-            slice char_sl = b.primary_char(str[i]);
-            whole = b.cat(whole, char_sl);
-        }
-
-        b.mark_end_states(whole, idx);
-        b.alt(prev, whole);
-    }
-
-    template<size_t N, size_t PatternSize>
-    constexpr void add_term_data_to_dfa(const regex_pattern_data<PatternSize>& pattern_data, dfa_builder<N>& b, size16_t idx);
-    
-    template<size_t N, typename Iterator, typename ErrorStream>
-    constexpr auto dfa_match(
-        const dfa<N>& sm,
-        match_options options,
-        source_point sp,
-        Iterator start,
-        Iterator end,
-        ErrorStream& error_stream)
-    {
-        size16_t state_idx = 0;
-        recognized_term rt;
-        size_t len = 0;
-        while (true)
-        {
-            const auto& state = sm[state_idx];
-            size16_t rec_idx = state.conflicted_recognition[0];
-            if (rec_idx != uninitialized16)
-            {
-                rt.len = len;
-                rt.term_idx = rec_idx;
-
-                if (options.verbose)
-                {
-                    error_stream << sp << " REGEX MATCH: Recognized " << rec_idx << "\n";
-                }
-            }
-
-            if (start == end)
-                break;
-
-            size16_t tr = state.transitions[utils::char_to_idx(*start)];
-            if (tr == uninitialized16)
-            {
-                break;
-            }
-
-            state_idx = tr;
-
-            if (options.verbose)
-            {
-                error_stream << sp << " REGEX MATCH: Current char " << utils::c_names.name(*start) << "\n";
-                error_stream << sp << " REGEX MATCH: New state " << state_idx << "\n";
-            }
-            sp.update(start, start + 1);
-            ++start;
-            ++len;
-        }
-        return rt;
-    }
-
-    template<typename Stream, typename StrTable, size_t N>
-    constexpr void write_dfa_state_diag_str(const dfa_state<N>& st, Stream& s, size16_t idx, const StrTable& term_names)
-    {
-        s << "STATE " << idx;
-        if (st.unreachable)
-        {
-            s << " (unreachable) \n";
-            return;
-        }
-
-        if (st.end_state)
-            s << " recognized ";
-        size16_t term_idx = st.conflicted_recognition[0];
-        if (term_idx != uninitialized16)
-            s << term_names[term_idx];
-        s << "   ";
-
-        auto f_range = [&s](const auto& r, size16_t state_idx)
-        {
-            if (r.size() > 2)
-            {
-                s << "[";
-                s << utils::c_names.name(r.front());
-                s << " - ";
-                s << utils::c_names.name(r.back());
-                s << "] -> " << state_idx << "  ";
-            }
-            else
-            {
-                for (char c : r)
-                {
-                    s << utils::c_names.name(c);
-                    s << " -> " << state_idx << "  ";
-                }
-            }
-        };
-
-        stdex::cvector<char, transitions_size> tmp;
-        size16_t prev = uninitialized16;
-        for (size_t i = 0; i < transitions_size + 1; ++i)
-        {
-            size16_t to = (i == transitions_size ? uninitialized16 : st.transitions[i]);
-            if (to == prev && to != uninitialized16)
-                tmp.push_back(utils::idx_to_char(i));
-            else
-            {
-                if (prev != uninitialized16)
-                {
-                    f_range(tmp, prev);
-                    tmp.clear();
-                }
-                if (to != uninitialized16)
-                    tmp.push_back(utils::idx_to_char(i));
-            }
-            prev = to;
-        }
-        s << "\n";
-    }
-
-    template<size_t N, typename Stream, typename StrTable>
-    constexpr void write_dfa_diag_str(const dfa<N>& sm, Stream& stream, const StrTable& term_names)
-    {
-        for (size16_t i = 0; i < sm.size(); ++i)
-            write_dfa_state_diag_str(sm[i], stream, i, term_names);
-    }
-
-    template<size_t N, typename Stream>
-    constexpr void write_dfa_diag_str(const dfa<N>& sm, Stream& stream)
-    {
-        write_dfa_diag_str(sm, stream, utils::fake_table<const char*>{""});
-    }
-}
 
 namespace detail
 {
@@ -1875,7 +1445,7 @@ private:
     using lexer_type = typename LexerUsage::type;
 
 public:
-    constexpr parser(
+    parser(
         root_nterm_type grammar_root,
         term_tuple_type terms,
         nterm_tuple_type nterms,
@@ -1885,7 +1455,7 @@ public:
         parser(grammar_root, terms, nterms, std::move(rules))
     {}
 
-    constexpr parser(
+    parser(
         root_nterm_type grammar_root,
         term_tuple_type terms,
         nterm_tuple_type nterms,
@@ -1894,7 +1464,7 @@ public:
         parser(grammar_root, terms, nterms, std::move(rules))
     {}
 
-    constexpr parser(
+    parser(
         root_nterm_type grammar_root,
         term_tuple_type terms,
         nterm_tuple_type nterms,
@@ -1911,10 +1481,10 @@ public:
         analyze_error_recovery_token();
         analyze_rules(std::make_index_sequence<std::tuple_size_v<rule_tuple_type>>{}, grammar_root);
 
-        state_analyzer sa(gi, states, parse_table);
+        parse_table.resize(state_count_cap * symbol_count);
+        state_analyzer sa(gi, term_names, nterm_names, parse_table);
         state_count = sa.analyze_states();
-
-        create_lexer(seq_for_terms);
+        parse_table.resize(state_count * symbol_count);
     }
 
     template<typename Buffer>
@@ -1966,11 +1536,11 @@ public:
         {
             size16_t cursor = ps.cursor_stack.back();
 
-            auto t_idx = get_current_term(ps);
+            auto t_idx = get_current_term(buffer, ps);
             if (t_idx == uninitialized16)
                 break;
 
-            const auto& entry = parse_table[cursor][get_parse_table_idx(true, t_idx)];
+            const auto& entry = parse_table[cursor * symbol_count + get_parse_table_idx(true, t_idx)];
 
             if (entry.kind == parse_table_entry_kind::error)
             {
@@ -2027,19 +1597,6 @@ public:
 
         s << "Parser object size: " << sizeof(*this) << "\n";
         s << "Number of states: " << state_count << "(cap: " << state_count_cap << ")\n";
-
-        size_t max_sit_count_per_state = 0;
-        for (size16_t i = 0; i < state_count; ++i)
-        {
-            size_t count = 0;
-            for (size32_t j = 0u; j < situation_address_space_size; ++j)
-            {
-                if (states[i].test(j))
-                    count++;
-            }
-            max_sit_count_per_state = std::max(max_sit_count_per_state, count);
-        }
-        s << "Max number of situations per state: " << max_sit_count_per_state  << "(cap: " << max_sit_count_per_state_cap << ")\n";
         s << "\n";
 
         s << "RULES\n\n";
@@ -2052,19 +1609,6 @@ public:
         }
         s << "\n";
 
-        s << "STATES\n\n";
-        for (size16_t i = 0; i < state_count; ++i)
-        {
-            write_state_diag_str(s, i);
-            s << "\n";
-        }
-        s << "\n";
-
-        if constexpr (generate_lexer)
-        {
-            s << "LEXICAL ANALYZER" << "\n\n";
-            regex::write_dfa_diag_str(lexer_sm, s, term_names);
-        }
         s << "\n";
     }
 
@@ -2086,8 +1630,6 @@ private:
     static const size_t state_count_cap = get_limits<Limits, situation_count>::state_count_cap;
     static const size_t max_sit_count_per_state_cap = get_limits<Limits, situation_count>::max_sit_count_per_state_cap;
     
-    static const size_t lexer_dfa_size = generate_lexer ? (0 + ... + Terms::dfa_size) : 1;
-
     using value_variant_type = meta::unique_types_variant_t<
         std::nullptr_t,
         no_type,
@@ -2133,8 +1675,6 @@ private:
         size16_t rule_last_terms[rule_count] = { };
     };
 
-    using situation_set = stdex::cbitset<situation_address_space_size>;
-    
     struct situation_info
     {
         size16_t rule_info_idx = uninitialized16;
@@ -2167,34 +1707,51 @@ private:
     {
         parse_table_entry_kind kind = parse_table_entry_kind::error;
         size16_t arg = uninitialized16;
-
-        size8_t has_sr_conflict = 0;
     };
-
-    using lr1_parse_table = parse_table_entry[state_count_cap][symbol_count];
-    using simple_state_table = situation_set[state_count_cap];
 
     struct state_analyzer
     {
-        constexpr state_analyzer(const grammar_info& gi, simple_state_table& simple_states, lr1_parse_table& parse_table):
-            gi(gi), simple_states(simple_states), parse_table(parse_table)
-        {}
+        state_analyzer(const grammar_info& gi,
+                       const char* const* term_names_ref,
+                       const char* const* nterm_names_ref,
+                       std::vector<parse_table_entry>& parse_table):
+            gi(gi),
+            term_names_ref(term_names_ref),
+            nterm_names_ref(nterm_names_ref),
+            parse_table(parse_table)
+        {
+            simple_states.resize(state_count_cap, stdex::dyn_bitset(situation_address_space_size));
+            states.reserve(state_count_cap);
 
-        using term_subset = stdex::cbitset<term_count>;
-        using nterm_subset = stdex::cbitset<nterm_count>;
-        using right_side_slice_subset = stdex::cbitset<situation_size * rule_count>;
-        using situation_vector = stdex::cvector<size32_t, max_sit_count_per_state_cap>;
-        
+            closures.resize(situation_address_space_size);
+            closures_analyzed.resize(situation_address_space_size);
+
+            right_side_slice_empty_analyzed.resize(situation_size * rule_count);
+            right_side_slice_empty.resize(situation_size * rule_count);
+            right_side_slice_first.resize(situation_size * rule_count,
+                                          stdex::dyn_bitset(term_count));
+            right_side_slice_first_analyzed.resize(situation_size * rule_count);
+            nterm_empty.resize(nterm_count);
+            nterm_first.resize(nterm_count, stdex::dyn_bitset(term_count));
+            nterm_empty_analyzed.resize(nterm_count);
+            nterm_first_analyzed.resize(nterm_count);
+        }
+
+        using term_subset = stdex::dyn_bitset;
+        using nterm_subset = stdex::dyn_bitset;
+        using right_side_slice_subset = stdex::dyn_bitset;
+        using situation_vector = std::vector<size32_t>;
+
         struct state
         {
-            situation_vector all_situations_vec = {};
-            situation_set kernel = {};
-            situation_vector situations_by_symbol[symbol_count] = {};
-        };
+            situation_vector all_situations_vec;
+            stdex::dyn_bitset kernel;
+            std::array<situation_vector, symbol_count> situations_by_symbol;
 
-        using state_table = state[state_count_cap];
+            state() : kernel(situation_address_space_size) {}
+        };
         
-        constexpr bool add_situation(size16_t state_idx, size32_t sit_idx, bool to_kernel)
+        bool add_situation(size16_t state_idx, size32_t sit_idx, bool to_kernel)
         {
             if (!simple_states[state_idx].test(sit_idx))
             {
@@ -2222,12 +1779,13 @@ private:
             return false;
         }
 
-        constexpr size16_t analyze_states()
+        size16_t analyze_states()
         {
             situation_info root_situation_info{ root_rule_idx, 0, eof_idx };
             size32_t root_sit_idx = make_situation_idx(root_situation_info);
             state_count = 1;
 
+            states.resize(1);
             size16_t current_state = 0;
             add_situation(current_state, root_sit_idx, true);
 
@@ -2248,7 +1806,7 @@ private:
             return state_count;
         }
 
-        constexpr void closure(size16_t state_idx, size32_t sit_idx)
+        void closure(size16_t state_idx, size32_t sit_idx)
         {
             if (closures_analyzed.test(sit_idx))
             {
@@ -2299,17 +1857,18 @@ private:
             }
         }
 
-        constexpr void transitions(size16_t state_idx, size16_t symbol_idx, const situation_vector& symbol_situations)
+        void transitions(size16_t state_idx, size16_t symbol_idx, const situation_vector& symbol_situations)
         {
             if (symbol_situations.size() == 0)
                 return;
 
             bool has_reduction = false;
             bool has_shift = false;
+            bool sr_resolved = false;
 
-            situation_set kernel;
+            stdex::dyn_bitset kernel(situation_address_space_size);
             situation_vector kernel_vec;
-            auto& entry = parse_table[state_idx][symbol_idx];
+            auto& entry = parse_table[state_idx * symbol_count + symbol_idx];
             size16_t reduction_rule_idx = uninitialized16;
 
             for (size32_t sit_idx : symbol_situations)
@@ -2328,15 +1887,17 @@ private:
 
                     if (has_reduction)
                     {
-                        entry.kind = parse_table_entry_kind::rr_conflict;
-                        break;
+                        throw_rr_conflict(state_idx, symbol_idx, reduction_rule_idx, info.rule_info_idx);
                     }
                     if (has_shift)
                     {
-                        if (!entry.has_sr_conflict)
+                        if (!sr_resolved)
                         {
-                            entry.kind = solve_conflict(info.rule_info_idx, info.t);
-                            entry.has_sr_conflict = true;
+                            auto res = solve_conflict(info.rule_info_idx, info.t);
+                            if (res == parse_table_entry_kind::error)
+                                throw_sr_conflict(state_idx, symbol_idx, info.rule_info_idx);
+                            entry.kind = res;
+                            sr_resolved = true;
                         }
                     }
                     else
@@ -2350,11 +1911,14 @@ private:
                 {
                     if (has_reduction)
                     {
-                        if (!entry.has_sr_conflict)
+                        if (!sr_resolved)
                         {
                             const auto& sm = gi.right_sides[ri.r_idx][info.after];
-                            entry.kind = solve_conflict(reduction_rule_idx, sm.idx);
-                            entry.has_sr_conflict = true;
+                            auto res = solve_conflict(reduction_rule_idx, sm.idx);
+                            if (res == parse_table_entry_kind::error)
+                                throw_sr_conflict(state_idx, symbol_idx, reduction_rule_idx);
+                            entry.kind = res;
+                            sr_resolved = true;
                         }
                     }
                     else
@@ -2387,6 +1951,8 @@ private:
                     new_state_idx = state_count++;
                     if (state_count > state_count_cap)
                         throw std::runtime_error("State count exceeds the cap");
+                    states.resize(state_count);
+                    states[new_state_idx].kernel = kernel;
                 }
 
                 entry.arg = new_state_idx;
@@ -2399,27 +1965,94 @@ private:
             else if (entry.kind == parse_table_entry_kind::reduce)
             {
                 entry.arg = reduction_rule_idx;
-                entry.has_sr_conflict = has_shift ? 1 : 0;
             }
         }
 
-        constexpr auto solve_conflict(size16_t rule_info_idx, size16_t term_idx) const
+        // Bison-подобное разрешение S/R:
+        //   * если приоритеты заданы и различны — побеждает больший
+        //   * при равенстве приоритетов используется ассоциативность
+        //   * если приоритеты не заданы или ассоциативность no_assoc,
+        //     решение неоднозначно и приводит к исключению
+        auto solve_conflict(size16_t rule_info_idx, size16_t term_idx) const
         {
             size16_t rule_idx = gi.rule_infos[rule_info_idx].r_idx;
             int r_p = gi.rule_precedences[rule_idx];
             int t_p = gi.term_precedences[term_idx];
-            if (r_p > t_p)
-                return parse_table_entry_kind::reduce;
 
-            if (r_p == t_p)
+            if (r_p == 0 || t_p == 0)
+                return parse_table_entry_kind::shift;
+
+            if (r_p > t_p) return parse_table_entry_kind::reduce;
+            if (r_p < t_p) return parse_table_entry_kind::shift;
+
+            switch (gi.rule_associativities[rule_idx])
             {
-                if (gi.rule_associativities[rule_idx] == associativity::ltor)
-                    return parse_table_entry_kind::reduce;
+                case associativity::ltor: return parse_table_entry_kind::reduce;
+                case associativity::rtol: return parse_table_entry_kind::shift;
+                default:                  return parse_table_entry_kind::error;
             }
-            return parse_table_entry_kind::shift;
         }
 
-        constexpr const term_subset& make_right_side_slice_first(const rule_info& ri, size_t start)
+        const char* symbol_name_of(size_t sym_idx) const
+        {
+            return sym_idx < nterm_count
+                ? nterm_names_ref[sym_idx]
+                : term_names_ref[sym_idx - nterm_count];
+        }
+
+        std::string format_rule(size_t rule_info_idx) const
+        {
+            const auto& ri = gi.rule_infos[rule_info_idx];
+            std::string s = nterm_names_ref[ri.l_idx];
+            s += " ->";
+            for (size_t i = 0; i < ri.r_elements; ++i)
+            {
+                const auto& sym = gi.right_sides[ri.r_idx][i];
+                s += " ";
+                s += (sym.term ? term_names_ref[sym.idx] : nterm_names_ref[sym.idx]);
+            }
+            return s;
+        }
+
+        void log_sr_resolved(size_t state_idx, size_t sym_idx,
+                             size_t rule_info_idx, parse_table_entry_kind res) const
+        {
+            std::cerr
+                << "S/R conflict at state " << state_idx
+                << " on '" << symbol_name_of(sym_idx) << "': resolved as "
+                << (res == parse_table_entry_kind::reduce ? "reduce" : "shift")
+                << " by '" << format_rule(rule_info_idx) << "'\n";
+        }
+
+        [[noreturn]] void throw_sr_conflict(size_t state_idx, size_t sym_idx,
+                                            size_t rule_info_idx) const
+        {
+            std::string msg = "S/R conflict (unresolved) at state ";
+            msg += std::to_string(state_idx);
+            msg += " on '";
+            msg += symbol_name_of(sym_idx);
+            msg += "': reduce by '";
+            msg += format_rule(rule_info_idx);
+            msg += "' vs shift";
+            throw std::runtime_error(msg);
+        }
+
+        [[noreturn]] void throw_rr_conflict(size_t state_idx, size_t sym_idx,
+                                            size_t rule_info_a, size_t rule_info_b) const
+        {
+            std::string msg = "R/R conflict at state ";
+            msg += std::to_string(state_idx);
+            msg += " on '";
+            msg += symbol_name_of(sym_idx);
+            msg += "': rule '";
+            msg += format_rule(rule_info_a);
+            msg += "' vs rule '";
+            msg += format_rule(rule_info_b);
+            msg += "'";
+            throw std::runtime_error(msg);
+        }
+
+        const term_subset& make_right_side_slice_first(const rule_info& ri, size_t start)
         {
             size_t right_side_slice_idx = max_rule_element_count * ri.r_idx + start;
             auto& res = right_side_slice_first[right_side_slice_idx];
@@ -2443,7 +2076,7 @@ private:
             return res;
         }
 
-        constexpr const term_subset& make_nterm_first(size16_t nt)
+        const term_subset& make_nterm_first(size16_t nt)
         {
             if (nterm_first_analyzed.test(nt))
                 return nterm_first[nt];
@@ -2458,7 +2091,7 @@ private:
             return nterm_first[nt];
         }
 
-        constexpr bool make_right_side_slice_empty(const rule_info& ri, size_t start)
+        bool make_right_side_slice_empty(const rule_info& ri, size_t start)
         {
             auto idx = ri.r_idx * situation_size + start;
             if (right_side_slice_empty_analyzed.test(idx))
@@ -2477,12 +2110,12 @@ private:
             return true;
         }
 
-        constexpr bool make_right_side_empty(const rule_info& ri)
+        bool make_right_side_empty(const rule_info& ri)
         {
             return make_right_side_slice_empty(ri, 0);
         }
 
-        constexpr bool make_nterm_empty(size16_t nt)
+        bool make_nterm_empty(size16_t nt)
         {
             if (nterm_empty_analyzed.test(nt))
                 return nterm_empty.test(nt);
@@ -2500,23 +2133,25 @@ private:
         }
 
         const grammar_info& gi;
-        simple_state_table& simple_states;
-        lr1_parse_table& parse_table;
+        const char* const* term_names_ref;
+        const char* const* nterm_names_ref;
+        std::vector<stdex::dyn_bitset> simple_states;
+        std::vector<parse_table_entry>& parse_table;
 
-        state states[state_count_cap] = {};
+        std::vector<state> states;
 
         size16_t state_count = 0;
-        situation_set closures_analyzed = {};
-        situation_vector closures[situation_address_space_size] = {};
+        stdex::dyn_bitset closures_analyzed;
+        std::vector<situation_vector> closures;
 
-        right_side_slice_subset right_side_slice_empty_analyzed = {};
-        right_side_slice_subset right_side_slice_empty = {};
-        term_subset right_side_slice_first[situation_size * rule_count] = {};
-        right_side_slice_subset right_side_slice_first_analyzed = {};
-        nterm_subset nterm_empty = { };
-        term_subset nterm_first[nterm_count] = { };
-        nterm_subset nterm_empty_analyzed = { };
-        nterm_subset nterm_first_analyzed = { };
+        stdex::dyn_bitset right_side_slice_empty_analyzed;
+        stdex::dyn_bitset right_side_slice_empty;
+        std::vector<stdex::dyn_bitset> right_side_slice_first;
+        stdex::dyn_bitset right_side_slice_first_analyzed;
+        stdex::dyn_bitset nterm_empty;
+        std::vector<stdex::dyn_bitset> nterm_first;
+        stdex::dyn_bitset nterm_empty_analyzed;
+        stdex::dyn_bitset nterm_first_analyzed;
     };
 
     constexpr static size16_t get_parse_table_idx(bool term, size16_t idx)
@@ -2673,69 +2308,6 @@ private:
         }
     }
 
-    template<typename Stream>
-    constexpr void write_situation_diag_str(Stream& s, size32_t idx) const
-    {
-        const situation_info info = make_situation_info(idx);
-        const rule_info& ri = gi.rule_infos[info.rule_info_idx];
-        s << nterm_names[ri.l_idx] << " <- ";
-        for (size_t i = 0u; i < info.after; ++i)
-        {
-            s << get_symbol_name(gi.right_sides[ri.r_idx][i]) << " ";
-        }
-        s << ". ";
-        for (size_t i = info.after; i < ri.r_elements; ++i)
-        {
-            s << get_symbol_name(gi.right_sides[ri.r_idx][i]) << " ";
-        }
-        s << "==> " << term_names[info.t];
-    }
-
-    template<typename Stream>
-    constexpr void write_state_diag_str(Stream& s, size16_t idx) const
-    {
-        s << "STATE " << idx << "\n";
-
-        for (size32_t i = 0u; i < situation_address_space_size; ++i)
-        {
-            if (states[idx].test(i))
-            {
-                write_situation_diag_str(s, i);
-                s << "\n";
-            }
-        }
-
-        s << "\n";
-
-        for (size_t i = 0; i < nterm_count; ++i)
-        {
-            const auto& entry = parse_table[idx][i];
-            if (is_shift(entry.kind))
-                s << "On " << nterm_names[i] << " go to " << entry.arg << "\n";
-        }
-        for (size_t i = nterm_count; i < nterm_count + term_count; ++i)
-        {
-            const auto& entry = parse_table[idx][i];
-            if (entry.kind == parse_table_entry_kind::error)
-                continue;
-
-            size_t term_idx = i - nterm_count;
-            s << "On " << term_names[term_idx];
-            if (entry.kind == parse_table_entry_kind::success)
-                s << " success \n";
-            else if (entry.kind == parse_table_entry_kind::reduce && entry.has_sr_conflict)
-                s << " S/R CONFLICT, prefer reduce(" << gi.rule_infos[entry.arg].r_idx << ") over shift\n";
-            else if (is_shift(entry.kind) && entry.has_sr_conflict)
-                s << " S/R CONFLICT, prefer shift over reduce(" << gi.rule_infos[entry.arg].r_idx << ")\n";
-            else if (is_shift(entry.kind))
-                s << " shift to " << entry.arg << "\n";
-            else if (entry.kind == parse_table_entry_kind::reduce)
-                s << " reduce using (" << gi.rule_infos[entry.arg].r_idx << ")\n";
-            else if (entry.kind == parse_table_entry_kind::rr_conflict)
-                s << " R/R CONFLICT - !!! FIX IT !!! \n";
-        }
-    }
-
     template<size16_t TermIdx>
     constexpr static value_variant_type string_view_to_term_value(const term_tuple_type& term_tuple, const std::string_view& sv, source_point sp)
     {
@@ -2777,7 +2349,7 @@ private:
         }
 
         ps.cursor_stack.erase(ps.cursor_stack.end() - ri.r_elements, ps.cursor_stack.end());
-        size16_t new_cursor_value = parse_table[ps.cursor_stack.back()][ri.l_idx].arg;
+        size16_t new_cursor_value = parse_table[ps.cursor_stack.back() * symbol_count + ri.l_idx].arg;
 
         if (ps.options.verbose)
         {
@@ -2902,8 +2474,8 @@ private:
         return true;
     }
 
-    template<typename ParseState>
-    constexpr size16_t get_current_term(ParseState& ps) const
+    template<typename Buffer, typename ParseState>
+    size16_t get_current_term(const Buffer& buffer, ParseState& ps) const
     {
         if (ps.in_recovery_mode())
             return error_recovery_token_idx;
@@ -2931,7 +2503,10 @@ private:
 
         if constexpr (generate_lexer)
         {
-            res = regex::dfa_match(lexer_sm, opts, ps.current_sp, ps.current_it, ps.buffer_end, ps.error_stream);
+            res = generated_match(buffer, ps.current_it, ps.buffer_end);
+            if (opts.verbose && res.term_idx != uninitialized16)
+                ps.error_stream << ps.current_sp << " LEXER MATCH: Recognized "
+                                << res.term_idx << "\n";
         }
         else
         {
@@ -2990,25 +2565,45 @@ private:
             ps.error_stream << ps.current_sp << " PARSE: Recognized " << term_names[ps.current_term_idx] << " \n";
     }
 
-    struct no_parser{};
+    // ---- std::regex-based generated lexer ----
+    template<typename Buffer, typename Iterator>
+    recognized_term generated_match(const Buffer& buffer, Iterator start, Iterator end) const
+    {
+        std::string_view sv = buffer.get_view(start, end);
+
+        size_t best_len = 0;
+        size16_t best_term = uninitialized16;
+        match_all_terms(std::make_index_sequence<sizeof...(Terms)>{}, sv, best_len, best_term);
+        return recognized_term(best_term, best_len);
+    }
 
     template<size_t... I>
-    constexpr void create_lexer(std::index_sequence<I...>)
+    void match_all_terms(std::index_sequence<I...>, std::string_view sv,
+                         size_t& best_len, size16_t& best_term) const
     {
-        if constexpr (generate_lexer)
+        (void(match_one_term<I>(std::get<I>(term_tuple), sv, best_len, best_term)), ...);
+    }
+
+    template<size_t I, typename Term>
+    void match_one_term(const Term& t, std::string_view sv,
+                        size_t& best_len, size16_t& best_term) const
+    {
+        size_t len = t.match(sv);
+        if (len > best_len)
         {
-            regex::dfa_builder<lexer_dfa_size> b(lexer_sm);
-            (void(regex::add_term_data_to_dfa(std::get<I>(term_tuple).get_data(), b, size16_t(I))), ...);
+            best_len = len;
+            best_term = size16_t(I);
         }
     }
+
+    struct no_parser{};
 
     str_table<term_count> term_names = {};
     str_table<term_count> term_ids = {};
     str_table<nterm_count> nterm_names = {};
     grammar_info gi = {};
 
-    simple_state_table states;
-    lr1_parse_table parse_table = {};
+    std::vector<parse_table_entry> parse_table;
 
     size16_t state_count = 0;
 
@@ -3019,8 +2614,7 @@ private:
     using string_view_to_term_value_t = value_variant_type(*)(const term_tuple_type&, const std::string_view&, source_point);
     string_view_to_term_value_t term_ftors[term_count] = {};
 
-    using dfa_type = regex::dfa<lexer_dfa_size>;
-    dfa_type lexer_sm = {};
+    // Лексер на std::regex больше не требует генерируемого DFA.
 };
 
 template<typename Root, typename Terms, typename NTerms, typename Rules>
@@ -3056,460 +2650,6 @@ struct skip
     constexpr skip(T&&) {}
 };
 
-namespace regex
-{
-    class regex_lexer
-    {
-    public:
-        constexpr regex_lexer()
-        {
-            //0              1             2 3 4 5 6 7 8 9
-            //regex_digit_09 regex_primary * + ? | ( ) { }
-
-            specials[utils::char_to_idx('*')] = 2;
-            specials[utils::char_to_idx('+')] = 3;
-            specials[utils::char_to_idx('?')] = 4;
-            specials[utils::char_to_idx('|')] = 5;
-            specials[utils::char_to_idx('(')] = 6;
-            specials[utils::char_to_idx(')')] = 7;
-            specials[utils::char_to_idx('{')] = 8;
-            specials[utils::char_to_idx('}')] = 9;
-        }
-
-        template<typename Iterator, typename ErrorStream>
-        constexpr auto match(
-            match_options options,
-            source_point sp,
-            Iterator start,
-            Iterator end,
-            ErrorStream& error_stream)
-        {
-            if (start == end)
-                return recognized_term{};
-
-            char c = *start;
-
-            auto res = [&](size16_t idx, size_t len)
-            { return recognized(idx, len, options, sp, error_stream); };
-
-            if (specials[utils::char_to_idx(c)] != 0)
-                return res(specials[utils::char_to_idx(c)], 1);
-
-            if (utils::is_dec_digit(c))
-                return res(0, 1);
-
-            size_t len = 0;
-            bool ok = match_primary(start, end, len);
-            if (ok)
-                return res(1, len);
-
-            return recognized_term{};
-        }
-
-    private:
-        size16_t specials[meta::distinct_chars_count] = {};
-
-        template<typename Iterator>
-        constexpr bool match_primary(Iterator start, Iterator end, size_t& len)
-        {
-            len = 0;
-            bool ok = match_escaped(start, end, len);
-            if (!ok)
-                return false;
-            if (len != 0)
-                return true;
-
-            ok = match_range(start, end, len);
-            if (!ok)
-                return false;
-            if (len != 0)
-                return true;
-
-            ok = utils::is_printable(*start);
-            if (ok)
-                len = 1;
-            return ok;
-        }
-
-        template<typename Iterator>
-        constexpr bool match_range(Iterator start, Iterator end, size_t& len)
-        {
-            char c = *start;
-            if (c == '[')
-            {
-                len = 1;
-                ++start;
-                if (start == end)
-                {
-                    len = 0;
-                    return false;
-                }
-                c = *start;
-                if (c == '^')
-                {
-                    len = 2;
-                    ++start;
-                }
-                if (start == end)
-                {
-                    len = 0;
-                    return false;
-                }
-                while (start != end && *start != ']')
-                {
-                    size_t item_len = 0;
-                    bool ok = match_range_item(start, end, item_len);
-                    if (!ok)
-                    {
-                        len = 0;
-                        return false;
-                    }
-                    len += item_len;
-                    start += item_len;
-                }
-                if (start == end)
-                {
-                    len = 0;
-                    return false;
-                }
-                len++;
-            }
-            return true;
-        }
-
-        template<typename Iterator>
-        constexpr bool match_range_item(Iterator start, Iterator end, size_t& len)
-        {
-            len = 0;
-            bool ok = match_escaped(start, end, len);
-            if (!ok)
-                return false;
-
-            if (len == 0)
-            {
-                ok = utils::is_printable(*start);
-                if (!ok)
-                    return false;
-                len = 1;
-            }
-
-            start += len;
-
-            if (*start == '-')
-            {
-                len++;
-
-                ++start;
-                if (start == end || *start == ']')
-                    return false;
-
-                size_t range_end_len = 0;
-                bool escaped_ok = match_escaped(start, end, range_end_len);
-                if (!escaped_ok)
-                    return false;
-
-                if (range_end_len == 0)
-                {
-                    ok = utils::is_printable(*start);
-                    if (!ok)
-                        return false;
-                    len += 1;
-                }
-                else
-                    len += range_end_len;
-            }
-
-            return ok;
-        }
-
-        template<typename Iterator>
-        constexpr bool match_escaped(Iterator start, Iterator end, size_t& len)
-        {
-            char c = *start;
-
-            if (c == '\\')
-            {
-                ++start;
-                if (start == end)
-                    return false;
-                c = *start;
-                len = 2;
-                if (c == 'x')
-                {
-                    ++start;
-                    if (start == end)
-                        return true;
-                    c = *start;
-                    if (!utils::is_hex_digit(c))
-                        return true;
-                    ++start;
-                    len = 3;
-                    if (start == end)
-                        return true;
-                    c = *start;
-                    if (!utils::is_hex_digit(c))
-                        return true;
-                    len = 4;
-                    return true;
-                }
-                return utils::is_printable(c);
-            }
-            return true;
-        }
-
-        template<typename ErrorStream>
-        constexpr auto recognized(
-            size16_t idx,
-            size_t len,
-            match_options options,
-            source_point sp,
-            ErrorStream& error_stream)
-        {
-            if (options.verbose)
-                error_stream << sp << " LEXER MATCH: Recognized " << idx << " \n";
-            return recognized_term(idx, len);
-        }
-    };
-
-    constexpr char regex_char(std::string_view sv, size_t& len)
-    {
-        if (sv[0] == '\\')
-        {
-            if (sv[1] == 'x')
-            {
-                if (sv.size() == 2 || !utils::is_hex_digit(sv[2]))
-                {
-                    len = 2;
-                    return 0;
-                }
-                else if (sv.size() == 3 || !utils::is_hex_digit(sv[3]))
-                {
-                    len = 3;
-                    return hex_digits_to_char('0', sv[2]);
-                }
-                else
-                {
-                    len = 4;
-                    return hex_digits_to_char(sv[2], sv[3]);
-                }
-            }
-            else
-            {
-                len = 2;
-                return sv[1];
-            }
-        }
-        else
-        {
-            len = 1;
-            return sv[0];
-        }
-    }
-
-    constexpr char_subset string_view_to_subset(std::string_view sv)
-    {
-        char_subset cs;
-
-        if (sv[0] == '.')
-            cs.flip();
-        else if (sv[0] == '[')
-        {
-            bool flip = false;
-            size_t i = 1;
-            if (sv[1] == '^')
-            {
-                i++;
-                flip = true;
-            }
-            while (sv[i] != ']')
-            {
-                size_t len = 0;
-                char c1 = regex_char(sv.substr(i), len);
-                i += len;
-                if (sv[i] == '-')
-                {
-                    ++i;
-                    char c2 = regex_char(sv.substr(i), len);
-                    cs.add_range(char_range{c1, c2});
-                }
-                else
-                    cs.set(utils::char_to_idx(c1));
-            }
-            if (flip)
-                cs.flip();
-        }
-        else
-        {
-            size_t len = 0;
-            cs.set(utils::char_to_idx(regex_char(sv, len)));
-        }
-
-        return cs;
-    }
-
-    namespace regex_parser
-    {
-        using slice = utils::slice;
-        using namespace ftors;
-
-        constexpr nterm<slice> expr("expr");
-        constexpr nterm<slice> alt("alt");
-        constexpr nterm<slice> concat("concat");
-        constexpr nterm<slice> q_expr("q_expr");
-        constexpr nterm<slice> primary("primary");
-        constexpr nterm<size32_t> number("number");
-
-        constexpr custom_term regex_digit_09("regex_digit_09", [](auto sv) { return size32_t(sv[0]) - '0'; });
-        constexpr custom_term regex_primary("regex_primary", string_view_to_subset);
-
-        constexpr parser regex_parser_object(
-            expr,
-            terms(regex_digit_09, regex_primary, '*', '+', '?', '|', '(', ')', '{', '}'),
-            nterms(expr, alt, concat, q_expr, primary, number),
-            rules(
-                number(regex_digit_09),
-                number(number, regex_digit_09) >= [](size32_t n, size32_t x){ return n * 10 + x; },
-                primary(regex_digit_09) >>= [](auto& ctx, size32_t number){ return ctx.primary_char(char(number + '0')); },
-                primary(regex_primary) >>= [](auto& ctx, const auto& s){ return ctx.primary_subset(s); },
-                primary('(', expr, ')') >= _e2,
-                q_expr(primary),
-                q_expr(primary, '*') >>= [](auto& ctx, slice s, skip) { return ctx.star(s); },
-                q_expr(primary, '+') >>= [](auto& ctx, slice s, skip) { return ctx.plus(s); },
-                q_expr(primary, '?') >>= [](auto& ctx, slice s, skip) { return ctx.opt(s); },
-                q_expr(primary, '{', number, '}') >>= [](auto& ctx, slice s, skip, size32_t n, skip) { return ctx.rep(s, n); },
-                concat(q_expr),
-                concat(concat, q_expr) >>= [](auto& ctx, slice s1, slice s2) { return ctx.cat(s1, s2); },
-                alt(concat),
-                alt(alt, '|', alt) >>= [](auto& ctx, slice s1, skip, slice s2) { return ctx.alt(s1, s2); },
-                expr(alt)
-            ),
-            use_lexer<regex_lexer>{}
-        );
-    }
-
-    template<size_t N>
-    constexpr size32_t analyze_dfa_size(const char (&pattern)[N])
-    {
-        buffers::cstring_buffer buffer(pattern);
-        utils::no_stream s{};
-        dfa_size_analyzer a;
-        auto res = regex_parser::regex_parser_object.context_parse(
-            a,
-            parse_options{}.set_skip_whitespace(false),
-            buffer,
-            s);
-        if (!res.has_value())
-            throw std::runtime_error("invalid regex");
-        return res.value().n;
-    }
-
-    template<size_t N, size_t PatternSize>
-    constexpr void add_term_data_to_dfa(const regex_pattern_data<PatternSize>& pattern_data, dfa_builder<N>& b, size16_t idx)
-    {
-        using slice = utils::slice;
-        utils::no_stream s{};
-        std::optional<slice> res = regex_parser::regex_parser_object.context_parse(
-            b,
-            parse_options{}.set_skip_whitespace(false),
-            buffers::cstring_buffer(pattern_data.pattern),
-            s
-        );
-
-        if (res.has_value())
-        {
-            slice prev{0, size32_t(b.size())};
-            b.mark_end_states(res.value(), idx);
-            b.alt(prev, res.value());
-        }
-        else
-            throw std::runtime_error("Regex parse error");
-    }
-
-    template<typename Stream>
-    constexpr void write_regex_parser_diag_msg(Stream& s)
-    {
-        regex_parser::regex_parser_object.write_diag_str(s);
-    }
-
-    template<auto& Pattern>
-    class expr
-    {
-    public:
-        static const size32_t dfa_size = analyze_dfa_size(Pattern);
-
-        constexpr expr()
-        {
-            dfa_builder<dfa_size> b(sm);
-            utils::no_stream stream{};
-            auto s = regex_parser::regex_parser_object.context_parse(
-                b,
-                parse_options{}.set_skip_whitespace(false),
-                buffers::cstring_buffer(Pattern),
-                stream
-            );
-            if (!s.has_value())
-                throw std::runtime_error("invalid regex");
-            b.mark_end_states(s.value(), 0);
-        }
-
-        template<typename Stream>
-        constexpr static void debug_parse(Stream& s)
-        {
-            regex::dfa_size_analyzer a;
-            regex_parser::regex_parser_object.context_parse(
-                a,
-                parse_options{}.set_skip_whitespace(false).set_verbose(),
-                buffers::cstring_buffer(Pattern),
-                s
-            );
-        }
-
-        template<size_t N>
-        constexpr bool match(const char (&str)[N]) const
-        {
-            return match(buffers::cstring_buffer(str));
-        }
-
-        template<typename Buffer>
-        constexpr bool match(const Buffer& buf) const
-        {
-            utils::no_stream s;
-            return match(buf, s);
-        }
-
-        template<typename Buffer, typename Stream>
-        constexpr bool match(const Buffer& buf, Stream& s) const
-        {
-            return match(match_options{}, buf, s);
-        }
-
-        template<typename Buffer, typename Stream>
-        constexpr bool match(match_options opts, const Buffer& buf, Stream& s) const
-        {
-            auto res = dfa_match(sm, opts, source_point{}, buf.begin(), buf.end(), s);
-            auto end = buf.begin() + res.len;
-            if (res.term_idx == 0 && end == buf.end())
-                return true;
-            else
-            {
-                if (res.term_idx == 0)
-                    s << "Leftover text after recognition: " << buf.get_view(end, buf.end()) << "\n";
-                else
-                    s << "Unexpected char: " << utils::c_names.name(*end) << "\n";
-                return false;
-            }
-        }
-
-        template<typename Stream>
-        constexpr void write_diag_str(Stream& stream) const
-        {
-            regex::write_dfa_diag_str(sm, stream);
-        }
-
-    private:
-        dfa<dfa_size> sm;
-    };
-}
 
 template<auto& Pattern>
 class regex_term : public term
@@ -3517,37 +2657,46 @@ class regex_term : public term
 public:
     using internal_value_type = std::string_view;
 
-    static const size_t dfa_size = regex::analyze_dfa_size(Pattern);
     static const bool is_trivial = false;
-
     static const size_t pattern_size = std::size(Pattern);
 
-    constexpr regex_term(associativity a = associativity::no_assoc) :
+    regex_term(associativity a = associativity::no_assoc) :
         regex_term(nullptr, 0, a)
     {}
 
-    constexpr regex_term(int precedence = 0, associativity a = associativity::no_assoc) :
+    regex_term(int precedence = 0, associativity a = associativity::no_assoc) :
         regex_term(nullptr, precedence, a)
     {}
 
-    constexpr regex_term(const char *custom_name, int precedence = 0, associativity a = associativity::no_assoc) :
+    regex_term(const char *custom_name, int precedence = 0, associativity a = associativity::no_assoc) :
         term(precedence, a),
-        custom_name(custom_name)
+        custom_name(custom_name),
+        re(Pattern)
     {
         id[0] = 'r';
         id[1] = '_';
-        utils::copy_array(&id[2], Pattern, std::make_index_sequence<pattern_size>{});
+        std::copy(Pattern, Pattern + pattern_size, id + 2);
     }
 
-    constexpr const char* get_name() const { return custom_name ? custom_name : id; }
-    constexpr const char* get_id() const { return id; }
-    constexpr auto get_data() const { return regex::regex_pattern_data<pattern_size>{ Pattern }; }
+    const char* get_name() const { return custom_name ? custom_name : id; }
+    const char* get_id() const { return id; }
 
-    constexpr const auto& get_ftor() const { return utils::pass_sv; }
+    const auto& get_ftor() const { return utils::pass_sv; }
+
+    // Возвращает длину совпадения от начала sv (0 — не совпало).
+    size_t match(std::string_view sv) const
+    {
+        std::cmatch m;
+        if (std::regex_search(sv.data(), sv.data() + sv.size(), m, re,
+                              std::regex_constants::match_continuous))
+            return m.length();
+        return 0;
+    }
 
 private:
     char id[pattern_size + 2] = {};
     const char* custom_name = nullptr;
+    std::regex re;
 };
 
 } // namespace ctpg
