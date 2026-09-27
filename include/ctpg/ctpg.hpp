@@ -5,7 +5,6 @@
 #include <type_traits>
 #include <array>
 #include <cstdint>
-#include <limits>
 #include <tuple>
 #include <algorithm>
 #include <vector>
@@ -17,9 +16,42 @@
 #include <stdexcept>
 #include <ostream>
 #include <regex>
+#include <cstring>
+#include <cstdio>
+#include <memory>
 
 namespace ctpg
 {
+
+namespace hash_detail
+{
+    constexpr uint64_t fnv_offset = 0xcbf29ce484222325ull;
+    constexpr uint64_t fnv_prime  = 0x100000001b3ull;
+
+    constexpr uint64_t fnv1a_byte(uint64_t h, uint8_t b)
+    {
+        return (h ^ b) * fnv_prime;
+    }
+
+    template<typename UInt>
+    constexpr uint64_t fnv1a_uint(uint64_t h, UInt v)
+    {
+        static_assert(std::is_unsigned_v<UInt>);
+        for (size_t i = 0; i < sizeof(UInt); ++i)
+        {
+            h = fnv1a_byte(h, static_cast<uint8_t>(v & 0xff));
+            v >>= 8;
+        }
+        return h;
+    }
+
+    constexpr uint64_t fnv1a_str(uint64_t h, const char* s)
+    {
+        if (!s) return fnv1a_byte(h, 0xff);
+        while (*s) { h = fnv1a_byte(h, static_cast<uint8_t>(*s)); ++s; }
+        return fnv1a_byte(h, 0);
+    }
+}
 
 using size_t = std::size_t;
 using size8_t = std::uint8_t;
@@ -1410,7 +1442,7 @@ template<typename T, size_t SituationCount>
 struct get_limits
 {
     static const size_t state_count_cap = T::state_count_cap;
-    static const size_t max_sit_count_per_state_cap = T::max_sit_count_per_state_cap;    
+    static const size_t max_sit_count_per_state_cap = T::max_sit_count_per_state_cap;
 };
 
 template<size_t SituationCount>
@@ -1418,6 +1450,213 @@ struct get_limits<default_limits, SituationCount>
 {
     static const size_t state_count_cap = SituationCount;
     static const size_t max_sit_count_per_state_cap = SituationCount;
+};
+
+
+class parse_table_view
+{
+public:
+    enum class entry_kind : uint8_t
+    {
+        error                      = 0,
+        success                    = 1,
+        shift                      = 2,
+        shift_error_recovery_token = 3,
+        reduce                     = 4,
+        rr_conflict                = 5,
+    };
+
+    struct entry
+    {
+        entry_kind kind = entry_kind::error;
+        uint16_t   arg  = 0xffffu;
+    };
+
+    static constexpr uint32_t magic       = 0x47505443u;   // "CTPG" LE
+    static constexpr uint32_t version     = 1u;
+    static constexpr size_t   header_size = 40;
+    static constexpr size_t   entry_size  = 4;
+
+    parse_table_view() = default;
+
+    parse_table_view(const uint8_t* data, size_t size)
+        : data_(data), size_(size)
+    {
+        if (size_ < header_size || read_u32(0) != magic || read_u32(4) != version)
+        {
+            data_ = nullptr;
+            return;
+        }
+
+        state_count_  = read_u32(8);
+        symbol_count_ = read_u32(12);
+        term_count_   = read_u32(16);
+        nterm_count_  = read_u32(20);
+        rule_count_   = read_u32(24);
+        grammar_hash_ = read_u64(32);
+
+        if (symbol_count_ != term_count_ + nterm_count_)
+            data_ = nullptr;
+        else if (size_ < compute_size(state_count_, symbol_count_))
+            data_ = nullptr;
+    }
+
+    bool valid() const { return data_ != nullptr; }
+
+    uint32_t state_count()  const { return state_count_; }
+    uint32_t symbol_count() const { return symbol_count_; }
+    uint32_t term_count()   const { return term_count_; }
+    uint32_t nterm_count()  const { return nterm_count_; }
+    uint32_t rule_count()   const { return rule_count_; }
+    uint64_t grammar_hash() const { return grammar_hash_; }
+
+    const uint8_t* data() const { return data_; }
+    size_t         size() const { return size_; }
+
+    bool matches(uint64_t expected) const
+    {
+        return data_ && grammar_hash_ == expected;
+    }
+
+    entry action(uint32_t state, uint32_t symbol) const
+    {
+        const uint8_t* p = data_ + header_size
+                         + (static_cast<size_t>(state) * symbol_count_ + symbol) * entry_size;
+        entry e;
+        e.kind = static_cast<entry_kind>(p[0]);
+        e.arg  = static_cast<uint16_t>(p[2] | (p[3] << 8));
+        return e;
+    }
+
+    static size_t compute_size(uint32_t states, uint32_t symbols)
+    {
+        return header_size + static_cast<size_t>(states) * symbols * entry_size;
+    }
+
+private:
+    uint32_t read_u32(size_t off) const
+    {
+        uint32_t v; std::memcpy(&v, data_ + off, sizeof(v)); return v;
+    }
+    uint64_t read_u64(size_t off) const
+    {
+        uint64_t v; std::memcpy(&v, data_ + off, sizeof(v)); return v;
+    }
+
+    const uint8_t* data_         = nullptr;
+    size_t         size_         = 0;
+    uint32_t       state_count_  = 0;
+    uint32_t       symbol_count_ = 0;
+    uint32_t       term_count_   = 0;
+    uint32_t       nterm_count_  = 0;
+    uint32_t       rule_count_   = 0;
+    uint64_t       grammar_hash_ = 0;
+};
+
+
+class parse_table
+{
+public:
+    parse_table() = default;
+    parse_table(parse_table&&) = default;
+    parse_table& operator=(parse_table&&) = default;
+    parse_table(const parse_table&) = delete;
+    parse_table& operator=(const parse_table&) = delete;
+
+    parse_table_view view() const
+    {
+        return parse_table_view{ blob_.data(), blob_.size() };
+    }
+
+    const std::vector<uint8_t>& blob() const { return blob_; }
+
+    void save(const char* path) const
+    {
+        std::FILE* f = std::fopen(path, "wb");
+        if (!f) throw std::runtime_error(std::string("cannot open ") + path);
+        size_t n = std::fwrite(blob_.data(), 1, blob_.size(), f);
+        std::fclose(f);
+        if (n != blob_.size())
+            throw std::runtime_error(std::string("write failed: ") + path);
+    }
+
+    static std::unique_ptr<parse_table> load(const char* path)
+    {
+        std::FILE* f = std::fopen(path, "rb");
+        if (!f) throw std::runtime_error(std::string("cannot open ") + path);
+        std::fseek(f, 0, SEEK_END);
+        long sz = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+
+        auto tbl = std::make_unique<parse_table>();
+        tbl->blob_.resize(static_cast<size_t>(sz));
+        size_t n = std::fread(tbl->blob_.data(), 1, sz, f);
+        std::fclose(f);
+        if (n != static_cast<size_t>(sz))
+            throw std::runtime_error(std::string("read failed: ") + path);
+        if (!tbl->view().valid())
+            throw std::runtime_error("invalid parse table file");
+        return tbl;
+    }
+
+    static std::unique_ptr<parse_table> from_blob(std::vector<uint8_t> blob)
+    {
+        auto tbl = std::make_unique<parse_table>();
+        tbl->blob_ = std::move(blob);
+        if (!tbl->view().valid())
+            throw std::runtime_error("invalid parse table blob");
+        return tbl;
+    }
+
+    static std::unique_ptr<parse_table> create(
+        uint64_t grammar_hash,
+        uint32_t state_count,
+        uint32_t symbol_count,
+        uint32_t term_count,
+        uint32_t nterm_count,
+        uint32_t rule_count,
+        const std::vector<parse_table_view::entry>& entries)
+    {
+        auto tbl = std::make_unique<parse_table>();
+        size_t total = parse_table_view::compute_size(state_count, symbol_count);
+        tbl->blob_.assign(total, 0);
+
+        uint8_t* p = tbl->blob_.data();
+        write_u32(p +  0, parse_table_view::magic);
+        write_u32(p +  4, parse_table_view::version);
+        write_u32(p +  8, state_count);
+        write_u32(p + 12, symbol_count);
+        write_u32(p + 16, term_count);
+        write_u32(p + 20, nterm_count);
+        write_u32(p + 24, rule_count);
+        write_u32(p + 28, 0);
+        write_u64(p + 32, grammar_hash);
+
+        uint8_t* ep = p + parse_table_view::header_size;
+        for (size_t i = 0; i < entries.size(); ++i)
+        {
+            ep[i * 4 + 0] = static_cast<uint8_t>(entries[i].kind);
+            ep[i * 4 + 1] = 0;
+            ep[i * 4 + 2] = static_cast<uint8_t>(entries[i].arg & 0xff);
+            ep[i * 4 + 3] = static_cast<uint8_t>((entries[i].arg >> 8) & 0xff);
+        }
+        return tbl;
+    }
+
+private:
+    static void write_u32(uint8_t* p, uint32_t v)
+    {
+        p[0] = static_cast<uint8_t>(v);
+        p[1] = static_cast<uint8_t>(v >> 8);
+        p[2] = static_cast<uint8_t>(v >> 16);
+        p[3] = static_cast<uint8_t>(v >> 24);
+    }
+    static void write_u64(uint8_t* p, uint64_t v)
+    {
+        for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i));
+    }
+
+    std::vector<uint8_t> blob_;
 };
 
 template<typename Root, typename Terms, typename NTerms, typename Rules, typename LexerUsage, typename Limits>
@@ -1480,48 +1719,111 @@ public:
         analyze_eof();
         analyze_error_recovery_token();
         analyze_rules(std::make_index_sequence<std::tuple_size_v<rule_tuple_type>>{}, grammar_root);
+    }
 
-        parse_table.resize(state_count_cap * symbol_count);
-        state_analyzer sa(gi, term_names, nterm_names, parse_table);
-        state_count = sa.analyze_states();
-        parse_table.resize(state_count * symbol_count);
+    // ---- Хэш грамматики ----
+    uint64_t compute_grammar_hash() const
+    {
+        using namespace hash_detail;
+        uint64_t h = fnv_offset;
+
+        h = fnv1a_uint(h, static_cast<uint64_t>(term_count));
+        h = fnv1a_uint(h, static_cast<uint64_t>(nterm_count));
+        h = fnv1a_uint(h, static_cast<uint64_t>(symbol_count));
+        h = fnv1a_uint(h, static_cast<uint64_t>(rule_count));
+        h = fnv1a_uint(h, static_cast<uint64_t>(situation_size));
+        h = fnv1a_uint(h, static_cast<uint64_t>(max_rule_element_count));
+
+        for (size_t i = 0; i < term_count; ++i)
+            h = fnv1a_str(h, term_ids[i]);
+        for (size_t i = 0; i < nterm_count; ++i)
+            h = fnv1a_str(h, nterm_names[i]);
+
+        for (size_t i = 0; i < term_count; ++i)
+        {
+            h = fnv1a_uint(h, static_cast<uint64_t>(gi.term_precedences[i]));
+            h = fnv1a_uint(h, static_cast<uint64_t>(gi.term_associativities[i]));
+        }
+
+        for (size_t i = 0; i < rule_count; ++i)
+        {
+            const auto& ri = gi.rule_infos[i];
+            h = fnv1a_uint(h, static_cast<uint64_t>(ri.l_idx));
+            h = fnv1a_uint(h, static_cast<uint64_t>(ri.r_idx));
+            h = fnv1a_uint(h, static_cast<uint64_t>(ri.r_elements));
+            for (size_t j = 0; j < ri.r_elements; ++j)
+            {
+                const auto& s = gi.right_sides[ri.r_idx][j];
+                h = fnv1a_uint(h, static_cast<uint64_t>(s.term ? 1 : 0));
+                h = fnv1a_uint(h, static_cast<uint64_t>(s.idx));
+            }
+            h = fnv1a_uint(h, static_cast<uint64_t>(gi.rule_precedences[ri.r_idx]));
+            h = fnv1a_uint(h, static_cast<uint64_t>(gi.rule_associativities[ri.r_idx]));
+        }
+        return h;
+    }
+
+    // ---- Построение таблицы разбора (только для генератора) ----
+    std::unique_ptr<parse_table> create_table() const
+    {
+        std::vector<parse_table_entry> entries(state_count_cap * symbol_count);
+        state_analyzer sa(gi, term_names, nterm_names, entries);
+        size_t st_count = sa.analyze_states();
+        entries.resize(st_count * symbol_count);
+
+        return parse_table::create(
+            compute_grammar_hash(),
+            static_cast<uint32_t>(st_count),
+            static_cast<uint32_t>(symbol_count),
+            static_cast<uint32_t>(term_count),
+            static_cast<uint32_t>(nterm_count),
+            static_cast<uint32_t>(rule_count),
+            entries);
     }
 
     template<typename Buffer>
-    constexpr std::optional<root_value_type> parse(const Buffer& buffer) const
+    std::optional<root_value_type> parse(const parse_table_view& table, const Buffer& buffer) const
     {
         utils::no_stream error_stream;
-        return parse(buffer, error_stream);
+        return parse(table, buffer, error_stream);
     }
 
     template<typename Context, typename Buffer>
-    constexpr std::optional<root_value_type> context_parse(Context&& ctx, const Buffer& buffer) const
+    std::optional<root_value_type> context_parse(Context&& ctx, const parse_table_view& table, const Buffer& buffer) const
     {
         utils::no_stream error_stream;
-        return context_parse(std::forward<Context>(ctx), buffer, error_stream);
+        return context_parse(std::forward<Context>(ctx), table, buffer, error_stream);
     }
 
     template<typename Buffer, typename ErrorStream>
-    constexpr std::optional<root_value_type> parse(const Buffer& buffer, ErrorStream& error_stream) const
+    std::optional<root_value_type> parse(const parse_table_view& table, const Buffer& buffer, ErrorStream& error_stream) const
     {
-        return parse(parse_options{}, buffer, error_stream);
+        return parse(table, parse_options{}, buffer, error_stream);
     }
 
     template<typename Context, typename Buffer, typename ErrorStream>
-    constexpr std::optional<root_value_type> context_parse(Context&& ctx, const Buffer& buffer, ErrorStream& error_stream) const
+    std::optional<root_value_type> context_parse(Context&& ctx, const parse_table_view& table, const Buffer& buffer, ErrorStream& error_stream) const
     {
-        return context_parse(std::forward<Context>(ctx), parse_options{}, buffer, error_stream);
+        return context_parse(std::forward<Context>(ctx), table, parse_options{}, buffer, error_stream);
     }
 
     template<typename Buffer, typename ErrorStream>
-    constexpr std::optional<root_value_type> parse(parse_options options, const Buffer& buffer, ErrorStream& error_stream) const
+    std::optional<root_value_type> parse(const parse_table_view& table, parse_options options, const Buffer& buffer, ErrorStream& error_stream) const
     {
-        return context_parse(no_type{}, options, buffer, error_stream);
+        return context_parse(no_type{}, table, options, buffer, error_stream);
     }
 
     template<typename Context, typename Buffer, typename ErrorStream>
-    constexpr std::optional<root_value_type> context_parse(Context&& ctx, parse_options options, const Buffer& buffer, ErrorStream& error_stream) const
+    std::optional<root_value_type> context_parse(Context&& ctx, const parse_table_view& table, parse_options options, const Buffer& buffer, ErrorStream& error_stream) const
     {
+        if (!table.valid())
+            throw std::runtime_error("parse_table_view is invalid");
+        if (!table.matches(compute_grammar_hash()))
+            throw std::runtime_error("parse table does not match grammar hash");
+        if (table.term_count() != term_count || table.nterm_count() != nterm_count
+            || table.rule_count() != rule_count)
+            throw std::runtime_error("parse table dimensions mismatch");
+
         detail::parser_value_stack_type_t<Buffer, empty_rules_count, value_variant_type> value_stack{};
         detail::parse_table_cursor_stack_type_t<Buffer, empty_rules_count> cursor_stack{};
 
@@ -1540,7 +1842,7 @@ public:
             if (t_idx == uninitialized16)
                 break;
 
-            const auto& entry = parse_table[cursor * symbol_count + get_parse_table_idx(true, t_idx)];
+            auto entry = table.action(cursor, get_parse_table_idx(true, t_idx));
 
             if (entry.kind == parse_table_entry_kind::error)
             {
@@ -1577,9 +1879,9 @@ public:
                 enter_consume_mode(ps);
             }
             else if (entry.kind == parse_table_entry_kind::reduce)
-                reduce(std::forward<Context>(ctx), ps, entry.arg);
+                reduce(std::forward<Context>(ctx), table, ps, entry.arg);
             else if (entry.kind == parse_table_entry_kind::rr_conflict)
-                rr_conflict(std::forward<Context>(ctx), ps, entry.arg);
+                rr_conflict(std::forward<Context>(ctx), table, ps, entry.arg);
             else if (entry.kind == parse_table_entry_kind::success)
             {
                 root_value = std::optional(std::move(success(ps)));
@@ -1591,25 +1893,22 @@ public:
     }
 
     template<typename Stream>
-    constexpr void write_diag_str(Stream& s) const
+    void write_diag_str(Stream& s, const parse_table_view& table) const
     {
         s << "PARSER" << "\n\n";
-
         s << "Parser object size: " << sizeof(*this) << "\n";
-        s << "Number of states: " << state_count << "(cap: " << state_count_cap << ")\n";
+        if (table.valid())
+            s << "Number of states: " << table.state_count() << "(cap: " << state_count_cap << ")\n";
         s << "\n";
 
         s << "RULES\n\n";
-
         for (size16_t i = 0; i < rule_count; ++i)
         {
             s << i << "    ";
-            write_rule_diag_str(s, i);
+            write_rule_diag_str(s, gi.rule_infos[i]);
             s << "\n";
         }
-        s << "\n";
-
-        s << "\n";
+        s << "\n\n";
     }
 
 private:
@@ -1696,18 +1995,14 @@ private:
         return situation_info{ rule_info_idx, after, t };
     }
 
-    enum class parse_table_entry_kind : size8_t { error, success, shift, shift_error_recovery_token, reduce, rr_conflict };
+    using parse_table_entry_kind = parse_table_view::entry_kind;
+    using parse_table_entry      = parse_table_view::entry;
 
     constexpr static bool is_shift(parse_table_entry_kind kind)
     {
-        return kind == parse_table_entry_kind::shift || kind == parse_table_entry_kind::shift_error_recovery_token;
+        return kind == parse_table_entry_kind::shift
+            || kind == parse_table_entry_kind::shift_error_recovery_token;
     }
-
-    struct parse_table_entry
-    {
-        parse_table_entry_kind kind = parse_table_entry_kind::error;
-        size16_t arg = uninitialized16;
-    };
 
     struct state_analyzer
     {
@@ -2293,9 +2588,8 @@ private:
     }
 
     template<typename Stream>
-    constexpr void write_rule_diag_str(Stream& s, size16_t rule_info_idx) const
+    void write_rule_diag_str(Stream& s, const rule_info& ri) const
     {
-        const rule_info& ri = gi.rule_infos[rule_info_idx];
         s << nterm_names[ri.l_idx] << " <- ";
         if (ri.r_elements > 0)
             s << get_symbol_name(gi.right_sides[ri.r_idx][0]);
@@ -2338,18 +2632,18 @@ private:
     }
 
     template<typename Context, typename ParseState>
-    constexpr void reduce(Context&& ctx, ParseState& ps, size16_t rule_info_idx) const
+    void reduce(Context&& ctx, const parse_table_view& table, ParseState& ps, size16_t rule_info_idx) const
     {
-        const auto& ri = gi.rule_infos[rule_info_idx];
+        const rule_info& ri = gi.rule_infos[rule_info_idx];
         if (ps.options.verbose)
         {
             ps.error_stream << ps.current_sp << " PARSE: Reduced using rule " << ri.r_idx << "  ";
-            write_rule_diag_str(ps.error_stream, rule_info_idx);
+            write_rule_diag_str(ps.error_stream, ri);
             ps.error_stream << "\n";
         }
 
         ps.cursor_stack.erase(ps.cursor_stack.end() - ri.r_elements, ps.cursor_stack.end());
-        size16_t new_cursor_value = parse_table[ps.cursor_stack.back() * symbol_count + ri.l_idx].arg;
+        size16_t new_cursor_value = table.action(ps.cursor_stack.back(), ri.l_idx).arg;
 
         if (ps.options.verbose)
         {
@@ -2364,13 +2658,11 @@ private:
     }
 
     template<typename Context, typename ParseState>
-    constexpr void rr_conflict(Context&& ctx, ParseState& ps, size16_t rule_idx) const
+    void rr_conflict(Context&& ctx, const parse_table_view& table, ParseState& ps, size16_t rule_idx) const
     {
         if (ps.options.verbose)
-        {
             ps.error_stream << ps.current_sp << " PARSE: R/R conflict encountered \n";
-        }
-        reduce(std::forward<Context>(ctx), ps, rule_idx);
+        reduce(std::forward<Context>(ctx), table, ps, rule_idx);
     }
 
     template<typename ParseState>
@@ -2602,10 +2894,6 @@ private:
     str_table<term_count> term_ids = {};
     str_table<nterm_count> nterm_names = {};
     grammar_info gi = {};
-
-    std::vector<parse_table_entry> parse_table;
-
-    size16_t state_count = 0;
 
     term_tuple_type term_tuple;
     nterm_tuple_type nterm_tuple;
