@@ -539,18 +539,25 @@ namespace utils
     }
 
     template<size_t N>
-    constexpr size_t find_str(const str_table<N>& table, const char* str)
+    size_t find_str(const str_table<N>& table, const char* str, const char* kind)
     {
-        size_t res = 0;
-        for (const auto& n : table)
+        for (size_t i = 0; i < N; ++i)
+            if (str_equal(table[i], str))
+                return i;
+
+        std::string msg = "ctpg: ";
+        msg += kind;
+        msg += " '";
+        msg += (str ? str : "<null>");
+        msg += "' is not declared. Declared ";
+        msg += kind;
+        msg += "s: ";
+        for (size_t i = 0; i < N; ++i)
         {
-            if (str_equal(n, str))
-                return res;
-            res++;
+            if (i > 0) msg += ", ";
+            msg += (table[i] ? table[i] : "<null>");
         }
-        if (res == N)
-            throw std::runtime_error("string not found");
-        return uninitialized;
+        throw std::runtime_error(std::move(msg));
     }
 
     constexpr size_t find_char(char c, const char* str)
@@ -968,7 +975,6 @@ class char_term : public term
 public:
     using internal_value_type = char;
 
-    static const size_t dfa_size = 2;
     static const bool is_trivial = true;
 
     constexpr char_term(char c, int precedence = 0, associativity a = associativity::no_assoc):
@@ -999,7 +1005,6 @@ class string_term : public term
 {
 public:
     using internal_value_type = std::string_view;
-    static const size_t dfa_size = (DataSize - 1) * 2;
     static const bool is_trivial = true;
 
     constexpr string_term(const char (&str)[DataSize], int precedence = 0, associativity a = associativity::no_assoc):
@@ -1031,7 +1036,6 @@ class typed_term
 {
 public:
     using internal_value_type = std::invoke_result_t<Ftor, std::string_view>;
-    static const size_t dfa_size = Term::dfa_size;
     static const bool is_trivial = Term::is_trivial;
 
     constexpr typed_term(Term t, Ftor f):
@@ -1061,7 +1065,6 @@ class custom_term : public term
 {
 public:
     using internal_value_type = std::invoke_result_t<Ftor, std::string_view>;
-    static const size_t dfa_size = 0;
     static const bool is_trivial = false;
 
     constexpr custom_term(const char* custom_name, Ftor ftor, int precedence = 0, associativity a = associativity::no_assoc):
@@ -2495,13 +2498,13 @@ private:
     template<typename Term>
     constexpr auto make_symbol(const Term& t) const
     {
-        return symbol{ true, size16_t(utils::find_str(term_ids, t.get_id())) };
+        return symbol{ true, size16_t(utils::find_str(term_ids, t.get_id(), "terminal"))};
     }
 
     template<typename ValueType>
     constexpr auto make_symbol(const nterm<ValueType>& nt) const
     {
-        return symbol{ false, size16_t(utils::find_str(nterm_names, nt.get_name())) };
+        return symbol{ false, size16_t(utils::find_str(nterm_names, nt.get_name(), "non-terminal")) };
     }
 
     template<size_t... I>
@@ -2573,7 +2576,7 @@ private:
     template<size_t Nr, bool RequiresContext, typename F, typename L, typename... R, size_t... I>
     constexpr void analyze_rule(const detail::rule<RequiresContext, F, L, R...>& r, std::index_sequence<I...>)
     {
-        size16_t l_idx = size16_t(utils::find_str(nterm_names, r.get_l().get_name()));
+        size16_t l_idx = size16_t(utils::find_str(nterm_names, r.get_l().get_name(), "non-terminal"));
         (void(gi.right_sides[Nr][I] = make_symbol(std::get<I>(r.get_r()))), ...);
         constexpr size16_t rule_elements_count = size16_t(sizeof...(R));
         gi.rule_infos[Nr] = { l_idx, size16_t(Nr), rule_elements_count };
